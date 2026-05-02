@@ -87,19 +87,27 @@ prompt_bool() {
 	done
 }
 
+env_value() {
+	local value="$1"
+	value="${value//\\/\\\\}"
+	value="${value//\"/\\\"}"
+	printf '"%s"' "${value}"
+}
+
 write_env_file() {
 	cat >"${ENV_FILE}" <<ENVEOF
-IMAP_HOST=${IMAP_HOST_VALUE}
-IMAP_USERNAME=${IMAP_USERNAME_VALUE}
-IMAP_PASSWORD=${IMAP_PASSWORD_VALUE}
-IMAP_MAILBOX=${IMAP_MAILBOX_VALUE}
-API_ENDPOINT=${API_ENDPOINT_VALUE}
-POLL_INTERVAL=${POLL_INTERVAL_VALUE}
-STATE_FILE=${STATE_FILE_VALUE}
-API_MAX_RETRIES=${API_MAX_RETRIES_VALUE}
-API_RETRY_BACKOFF=${API_RETRY_BACKOFF_VALUE}
-HTTP_TIMEOUT=${HTTP_TIMEOUT_VALUE}
-PROCESS_EXISTING=${PROCESS_EXISTING_VALUE}
+IMAP_HOST=$(env_value "${IMAP_HOST_VALUE}")
+IMAP_USERNAME=$(env_value "${IMAP_USERNAME_VALUE}")
+IMAP_PASSWORD=$(env_value "${IMAP_PASSWORD_VALUE}")
+IMAP_MAILBOX=$(env_value "${IMAP_MAILBOX_VALUE}")
+API_ENDPOINT=$(env_value "${API_ENDPOINT_VALUE}")
+API_HMAC_SECRET=$(env_value "${API_HMAC_SECRET_VALUE}")
+POLL_INTERVAL=$(env_value "${POLL_INTERVAL_VALUE}")
+STATE_FILE=$(env_value "${STATE_FILE_VALUE}")
+API_MAX_RETRIES=$(env_value "${API_MAX_RETRIES_VALUE}")
+API_RETRY_BACKOFF=$(env_value "${API_RETRY_BACKOFF_VALUE}")
+HTTP_TIMEOUT=$(env_value "${HTTP_TIMEOUT_VALUE}")
+PROCESS_EXISTING=$(env_value "${PROCESS_EXISTING_VALUE}")
 ENVEOF
 }
 
@@ -164,6 +172,7 @@ create_env_file() {
 	prompt_secret IMAP_PASSWORD_VALUE "Gmail app password"
 	prompt_value IMAP_MAILBOX_VALUE "IMAP mailbox" "INBOX"
 	prompt_required API_ENDPOINT_VALUE "API endpoint URL"
+	prompt_secret API_HMAC_SECRET_VALUE "API HMAC secret"
 	prompt_value POLL_INTERVAL_VALUE "Poll interval" "30s"
 	prompt_value STATE_FILE_VALUE "State file" "${STATE_DIR}/state.json"
 	prompt_value API_MAX_RETRIES_VALUE "API max retries" "5"
@@ -216,7 +225,8 @@ enable_service() {
 }
 
 config_is_ready() {
-	! grep -Eq 'user@example\.com|app-password|https://api\.example\.com/email-webhook' "${ENV_FILE}"
+	grep -Eq '^API_HMAC_SECRET=.+' "${ENV_FILE}" &&
+		! grep -Eq 'user@example\.com|app-password|https://api\.example\.com/email-webhook|api-hmac-secret' "${ENV_FILE}"
 }
 
 main() {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -37,6 +38,7 @@ type Config struct {
 	Password     string
 	Mailbox      string
 	APIEndpoint  string
+	APIHMACSecret string
 	PollInterval time.Duration
 	StateFile    string
 	APIMaxRetries  int
@@ -480,6 +482,7 @@ func postPayload(ctx context.Context, cfg Config, payload EmailPayload) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", idempotencyKey(payload))
+	signRequest(req, cfg.APIHMACSecret, body)
 
 	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
 	resp, err := httpClient.Do(req)
@@ -494,6 +497,18 @@ func postPayload(ctx context.Context, cfg Config, payload EmailPayload) error {
 	}
 
 	return nil
+}
+
+func signRequest(req *http.Request, secret string, body []byte) {
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("."))
+	mac.Write(body)
+
+	req.Header.Set("X-Help-Email-Signature-Algorithm", "hmac-sha256")
+	req.Header.Set("X-Help-Email-Timestamp", timestamp)
+	req.Header.Set("X-Help-Email-Signature", hex.EncodeToString(mac.Sum(nil)))
 }
 
 func idempotencyKey(payload EmailPayload) string {
@@ -555,6 +570,7 @@ func loadConfig() (Config, error) {
 		Password:     os.Getenv("IMAP_PASSWORD"),
 		Mailbox:      envDefault("IMAP_MAILBOX", "INBOX"),
 		APIEndpoint:  os.Getenv("API_ENDPOINT"),
+		APIHMACSecret: os.Getenv("API_HMAC_SECRET"),
 		PollInterval: interval,
 		StateFile:    envDefault("STATE_FILE", ".help-email-state.json"),
 		APIMaxRetries:  apiMaxRetries,
@@ -568,6 +584,7 @@ func loadConfig() (Config, error) {
 		"IMAP_USERNAME": cfg.Username,
 		"IMAP_PASSWORD": cfg.Password,
 		"API_ENDPOINT":  cfg.APIEndpoint,
+		"API_HMAC_SECRET": cfg.APIHMACSecret,
 	} {
 		if value == "" {
 			missing = append(missing, key)

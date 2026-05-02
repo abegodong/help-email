@@ -52,6 +52,22 @@ Attachments are included inline as base64 by default. For large production mailb
 
 Each API request includes an `Idempotency-Key` header. It uses `message_id` when available and falls back to `mailbox:uid`, so the receiving API can safely deduplicate retry attempts.
 
+Each API request is also signed with HMAC-SHA256. The service signs this string:
+
+```text
+<X-Help-Email-Timestamp>.<raw JSON request body>
+```
+
+It sends these headers:
+
+```text
+X-Help-Email-Signature-Algorithm: hmac-sha256
+X-Help-Email-Timestamp: 2026-05-02T12:35:02Z
+X-Help-Email-Signature: <hex-encoded HMAC-SHA256>
+```
+
+The API should recompute the signature with the shared `API_HMAC_SECRET` and compare it using a constant-time comparison. The timestamp lets the API reject stale replay attempts.
+
 ## Configuration
 
 Set these environment variables:
@@ -62,6 +78,7 @@ IMAP_USERNAME=user@example.com
 IMAP_PASSWORD=app-password
 IMAP_MAILBOX=INBOX
 API_ENDPOINT=https://api.example.com/email-webhook
+API_HMAC_SECRET=replace-with-shared-secret
 POLL_INTERVAL=30s
 STATE_FILE=.help-email-state.json
 API_MAX_RETRIES=5
@@ -143,6 +160,7 @@ IMAP_USERNAME=user@example.com
 IMAP_PASSWORD=app-password
 IMAP_MAILBOX=INBOX
 API_ENDPOINT=https://api.example.com/email-webhook
+API_HMAC_SECRET=replace-with-shared-secret
 POLL_INTERVAL=30s
 STATE_FILE=/var/lib/help-email/state.json
 API_MAX_RETRIES=5
@@ -151,7 +169,7 @@ HTTP_TIMEOUT=30s
 PROCESS_EXISTING=false
 ```
 
-Lock down the environment file because it contains the Gmail password:
+Lock down the environment file because it contains the Gmail password and API HMAC secret:
 
 ```sh
 sudo chown root:help-email /etc/help-email/help-email.env
