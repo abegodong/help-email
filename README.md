@@ -115,9 +115,9 @@ The easiest path is to run the installer script from the repository root:
 sudo ./scripts/install-systemd.sh
 ```
 
-The script installs Go if needed, builds the binary, creates the `help-email` system user, creates `/etc/help-email/help-email.env` if it does not already exist, installs the systemd unit, and enables the service. It starts or restarts the service only when the environment file no longer contains placeholder credentials.
+The script installs Go if needed, builds the binary, creates the `help-email` system user, asks interactively for the Gmail/API configuration, writes `/etc/help-email/help-email.env`, installs the systemd unit, and enables the service. If the environment file already exists, the script asks whether to keep or replace it. The Gmail password prompt is hidden.
 
-After the script finishes, edit the environment file with real credentials and restart:
+After the script finishes, review the environment file and restart if you changed anything:
 
 ```sh
 sudo nano /etc/help-email/help-email.env

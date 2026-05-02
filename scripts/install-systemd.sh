@@ -14,6 +14,95 @@ BINARY_NAME="${BINARY_NAME:-help-email}"
 BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 GOARCH_VALUE="${GOARCH_VALUE:-amd64}"
 
+prompt_value() {
+	local var_name="$1"
+	local label="$2"
+	local default_value="$3"
+	local value
+
+	read -r -p "${label} [${default_value}]: " value
+	printf -v "${var_name}" '%s' "${value:-${default_value}}"
+}
+
+prompt_secret() {
+	local var_name="$1"
+	local label="$2"
+	local value
+
+	while [[ -z "${value:-}" ]]; do
+		read -r -s -p "${label}: " value
+		echo
+		if [[ -z "${value}" ]]; then
+			echo "Value is required."
+		fi
+	done
+
+	printf -v "${var_name}" '%s' "${value}"
+}
+
+prompt_required() {
+	local var_name="$1"
+	local label="$2"
+	local default_value="${3:-}"
+	local value
+	local suffix=""
+
+	if [[ -n "${default_value}" ]]; then
+		suffix=" [${default_value}]"
+	fi
+
+	while [[ -z "${value:-}" ]]; do
+		read -r -p "${label}${suffix}: " value
+		value="${value:-${default_value}}"
+		if [[ -z "${value}" ]]; then
+			echo "Value is required."
+		fi
+	done
+
+	printf -v "${var_name}" '%s' "${value}"
+}
+
+prompt_bool() {
+	local var_name="$1"
+	local label="$2"
+	local default_value="$3"
+	local value
+
+	while true; do
+		read -r -p "${label} [${default_value}]: " value
+		value="${value:-${default_value}}"
+		case "${value,,}" in
+			true|t|yes|y|1)
+				printf -v "${var_name}" '%s' "true"
+				return
+				;;
+			false|f|no|n|0)
+				printf -v "${var_name}" '%s' "false"
+				return
+				;;
+			*)
+				echo "Enter true or false."
+				;;
+		esac
+	done
+}
+
+write_env_file() {
+	cat >"${ENV_FILE}" <<ENVEOF
+IMAP_HOST=${IMAP_HOST_VALUE}
+IMAP_USERNAME=${IMAP_USERNAME_VALUE}
+IMAP_PASSWORD=${IMAP_PASSWORD_VALUE}
+IMAP_MAILBOX=${IMAP_MAILBOX_VALUE}
+API_ENDPOINT=${API_ENDPOINT_VALUE}
+POLL_INTERVAL=${POLL_INTERVAL_VALUE}
+STATE_FILE=${STATE_FILE_VALUE}
+API_MAX_RETRIES=${API_MAX_RETRIES_VALUE}
+API_RETRY_BACKOFF=${API_RETRY_BACKOFF_VALUE}
+HTTP_TIMEOUT=${HTTP_TIMEOUT_VALUE}
+PROCESS_EXISTING=${PROCESS_EXISTING_VALUE}
+ENVEOF
+}
+
 require_root() {
 	if [[ "${EUID}" -ne 0 ]]; then
 		echo "Run this script as root: sudo $0"
@@ -59,23 +148,31 @@ create_directories() {
 
 create_env_file() {
 	if [[ -f "${ENV_FILE}" ]]; then
-		echo "Keeping existing ${ENV_FILE}"
-	else
-		cat >"${ENV_FILE}" <<'ENVEOF'
-IMAP_HOST=imap.gmail.com:993
-IMAP_USERNAME=user@example.com
-IMAP_PASSWORD=app-password
-IMAP_MAILBOX=INBOX
-API_ENDPOINT=https://api.example.com/email-webhook
-POLL_INTERVAL=30s
-STATE_FILE=/var/lib/help-email/state.json
-API_MAX_RETRIES=5
-API_RETRY_BACKOFF=2s
-HTTP_TIMEOUT=30s
-PROCESS_EXISTING=false
-ENVEOF
-		echo "Created ${ENV_FILE}. Edit it before relying on the service."
+		local replace_config
+		prompt_bool replace_config "${ENV_FILE} already exists. Replace it?" "false"
+		if [[ "${replace_config}" != "true" ]]; then
+			echo "Keeping existing ${ENV_FILE}"
+			chown "root:${SERVICE_GROUP}" "${ENV_FILE}"
+			chmod 0640 "${ENV_FILE}"
+			return
+		fi
 	fi
+
+	echo "Enter service configuration values."
+	prompt_value IMAP_HOST_VALUE "Gmail IMAP host" "imap.gmail.com:993"
+	prompt_required IMAP_USERNAME_VALUE "Gmail username"
+	prompt_secret IMAP_PASSWORD_VALUE "Gmail app password"
+	prompt_value IMAP_MAILBOX_VALUE "IMAP mailbox" "INBOX"
+	prompt_required API_ENDPOINT_VALUE "API endpoint URL"
+	prompt_value POLL_INTERVAL_VALUE "Poll interval" "30s"
+	prompt_value STATE_FILE_VALUE "State file" "${STATE_DIR}/state.json"
+	prompt_value API_MAX_RETRIES_VALUE "API max retries" "5"
+	prompt_value API_RETRY_BACKOFF_VALUE "API retry backoff" "2s"
+	prompt_value HTTP_TIMEOUT_VALUE "HTTP timeout" "30s"
+	prompt_bool PROCESS_EXISTING_VALUE "Process existing mailbox messages on first run?" "false"
+
+	write_env_file
+	echo "Created ${ENV_FILE}"
 
 	chown "root:${SERVICE_GROUP}" "${ENV_FILE}"
 	chmod 0640 "${ENV_FILE}"
