@@ -1,6 +1,6 @@
 # help-email
 
-A small Go service that polls a Gmail inbox over IMAP, parses new email, and forwards a structured JSON payload to an API endpoint.
+A small Go service that polls an email inbox, parses new email, and forwards a structured JSON payload to an API endpoint. It supports Gmail over IMAP and Microsoft 365 shared or user mailboxes through Microsoft Graph.
 
 ## Payload sent to the API
 
@@ -42,15 +42,23 @@ A small Go service that polls a Gmail inbox over IMAP, parses new email, and for
   "imap": {
     "mailbox": "INBOX",
     "uid": 123
+  },
+  "graph": {
+    "mailbox": "shared-mailbox@example.com",
+    "message_id": "AAMkAG...",
+    "conversation_id": "AAQkAG...",
+    "received_at": "2026-05-02T12:35:02Z"
   }
 }
 ```
+
+Only one provider metadata object is sent per message: `imap` for Gmail/IMAP or `graph` for Microsoft 365.
 
 `sender.source` is `header` for a normal email and `forwarded_body` when a forwarded-message block reveals the original sender. In forwarded cases, `forwarder` contains the mailbox-visible sender.
 
 Attachments are included inline as base64 by default. For large production mailboxes, a common next step is to upload attachments to object storage and replace `content_base64` with signed URLs.
 
-Each API request includes an `Idempotency-Key` header. It uses `message_id` when available and falls back to `mailbox:uid`, so the receiving API can safely deduplicate retry attempts.
+Each API request includes an `Idempotency-Key` header. It uses `message_id` when available and falls back to provider metadata, so the receiving API can safely deduplicate retry attempts.
 
 Each API request is also signed with HMAC-SHA256. The service signs this string:
 
@@ -73,6 +81,7 @@ The API should recompute the signature with the shared `API_HMAC_SECRET` and com
 Set these environment variables:
 
 ```sh
+MAIL_PROVIDER=imap
 IMAP_HOST=imap.gmail.com:993
 IMAP_USERNAME=user@example.com
 IMAP_PASSWORD=app-password
@@ -87,9 +96,88 @@ HTTP_TIMEOUT=30s
 PROCESS_EXISTING=false
 ```
 
+`MAIL_PROVIDER=imap` uses Gmail or another IMAP mailbox. `MAIL_PROVIDER=graph` uses Microsoft Graph for Microsoft 365.
+
 `IMAP_HOST` defaults to Gmail (`imap.gmail.com:993`), so you can omit it for Gmail. For Gmail authentication, use an app password or replace the login flow with OAuth2 if your Workspace policy requires it.
 
 `PROCESS_EXISTING=false` means the first run starts monitoring from the current Gmail `UIDNEXT` and only sends newly arriving messages. Set it to `true` if you want to submit already existing mailbox messages too.
+
+For Microsoft 365 Graph, use:
+
+```sh
+MAIL_PROVIDER=graph
+GRAPH_TENANT_ID=00000000-0000-0000-0000-000000000000
+GRAPH_CLIENT_ID=00000000-0000-0000-0000-000000000000
+GRAPH_CLIENT_SECRET=client-secret
+GRAPH_MAILBOX=shared-mailbox@example.com
+API_ENDPOINT=https://api.example.com/email-webhook
+API_HMAC_SECRET=replace-with-shared-secret
+POLL_INTERVAL=30s
+STATE_FILE=.help-email-state.json
+API_MAX_RETRIES=5
+API_RETRY_BACKOFF=2s
+HTTP_TIMEOUT=30s
+PROCESS_EXISTING=false
+```
+
+For unattended system service use, create a Microsoft Entra app registration and grant Microsoft Graph application permission `Mail.ReadWrite`, then admin-consent it. In production, restrict the app to the intended mailbox with an Exchange Online application access policy. `GRAPH_MAILBOX` can be a user mailbox or a shared mailbox email address.
+
+With `PROCESS_EXISTING=false`, the first Graph run records the current time and only sends unread messages received after that point. With `PROCESS_EXISTING=true`, it sends existing unread inbox messages too. After successful API submission, Graph messages are marked read by setting `isRead` to `true`.
+
+## Get Microsoft 365 Graph config from Entra
+
+You need these values for `MAIL_PROVIDER=graph`:
+
+```sh
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
+GRAPH_MAILBOX=
+```
+
+Create the app registration:
+
+1. Sign in to the [Microsoft Entra admin center](https://entra.microsoft.com/).
+2. Go to **Entra ID > App registrations > New registration**.
+3. Give the app a name, for example `help-email`.
+4. Choose **Accounts in this organizational directory only** unless you intentionally need a multi-tenant app.
+5. Select **Register**.
+
+Copy IDs from the app overview:
+
+1. Open the app registration.
+2. Go to **Overview**.
+3. Copy **Directory (tenant) ID** into `GRAPH_TENANT_ID`.
+4. Copy **Application (client) ID** into `GRAPH_CLIENT_ID`.
+
+Create the client secret:
+
+1. In the app registration, go to **Certificates & secrets**.
+2. Select **Client secrets > New client secret**.
+3. Add a description and expiration.
+4. Select **Add**.
+5. Copy the secret **Value** immediately into `GRAPH_CLIENT_SECRET`. The portal only shows this value once.
+
+Grant Microsoft Graph mail permissions:
+
+1. In the app registration, go to **API permissions**.
+2. Select **Add a permission**.
+3. Select **Microsoft Graph**.
+4. Select **Application permissions**.
+5. Add `Mail.ReadWrite`.
+6. Select **Grant admin consent** for the tenant.
+
+Set the mailbox:
+
+```sh
+GRAPH_MAILBOX=shared-mailbox@example.com
+```
+
+`GRAPH_MAILBOX` should be the primary SMTP address or user principal name of the Microsoft 365 mailbox to monitor. It can be a normal user mailbox or a shared mailbox.
+
+Recommended production scoping:
+
+`Mail.ReadWrite` as an application permission can allow access to mailboxes across the tenant. Ask the Exchange/Microsoft 365 admin to restrict this app to only the target mailbox or mailbox group. Microsoft now documents Exchange Online RBAC for Applications for resource-scoped Graph access; older tenants may also use Application Access Policies.
 
 Run:
 
@@ -98,7 +186,7 @@ go mod tidy
 go run ./cmd/help-email
 ```
 
-The service stores the last successfully submitted and read-marked UID in `STATE_FILE`, so restarts do not resend old mail. After the API endpoint returns a `2xx` response, the service marks the Gmail message as read with the IMAP `\Seen` flag. If submission fails, the message is not marked read and the service retries on the next poll.
+The service stores provider state in `STATE_FILE`, so restarts do not resend old mail. After the API endpoint returns a `2xx` response, the service marks the source message as read. If submission fails, the message is not marked read and the service retries on the next poll.
 
 ## Build
 
@@ -113,7 +201,7 @@ Fetch dependencies and build the service:
 
 ```sh
 go mod tidy
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o help-email ./cmd/help-email
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o help-email ./cmd/help-email
 ```
 
 Run the binary locally:
@@ -132,7 +220,7 @@ The easiest path is to run the installer script from the repository root:
 sudo ./scripts/install-systemd.sh
 ```
 
-The script installs Go if needed, builds the binary, creates the `help-email` system user, asks interactively for the Gmail/API configuration, writes `/etc/help-email/help-email.env`, installs the systemd unit, and enables the service. If the environment file already exists, the script asks whether to keep or replace it. The Gmail password prompt is hidden.
+The script installs Go if needed, builds the binary, creates the `help-email` system user, asks interactively for the mail provider and API configuration, writes `/etc/help-email/help-email.env`, installs the systemd unit, and enables the service. If the environment file already exists, the script asks whether to keep or replace it. Secret prompts are hidden.
 
 After the script finishes, review the environment file and restart if you changed anything:
 
@@ -155,10 +243,15 @@ sudo chown help-email:help-email /var/lib/help-email
 Create `/etc/help-email/help-email.env`:
 
 ```sh
+MAIL_PROVIDER=imap
 IMAP_HOST=imap.gmail.com:993
 IMAP_USERNAME=user@example.com
 IMAP_PASSWORD=app-password
 IMAP_MAILBOX=INBOX
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
+GRAPH_MAILBOX=
 API_ENDPOINT=https://api.example.com/email-webhook
 API_HMAC_SECRET=replace-with-shared-secret
 POLL_INTERVAL=30s
@@ -169,7 +262,7 @@ HTTP_TIMEOUT=30s
 PROCESS_EXISTING=false
 ```
 
-Lock down the environment file because it contains the Gmail password and API HMAC secret:
+Lock down the environment file because it contains mail provider credentials and API HMAC secret:
 
 ```sh
 sudo chown root:help-email /etc/help-email/help-email.env
@@ -180,7 +273,7 @@ Create `/etc/systemd/system/help-email.service`:
 
 ```ini
 [Unit]
-Description=Gmail IMAP to API email monitor
+Description=Email to API monitor
 After=network-online.target
 Wants=network-online.target
 
@@ -224,3 +317,13 @@ To deploy a new build, replace `/usr/local/bin/help-email` and restart the servi
 sudo install -o root -g root -m 0755 help-email /usr/local/bin/help-email
 sudo systemctl restart help-email
 ```
+
+## Uninstall the systemd service
+
+Run the uninstaller from the repository root:
+
+```sh
+sudo ./scripts/uninstall-systemd.sh
+```
+
+The script stops and disables the service, removes `/etc/systemd/system/help-email.service`, removes `/usr/local/bin/help-email`, reloads systemd, and asks before deleting `/etc/help-email`, `/var/lib/help-email`, or the `help-email` service user.

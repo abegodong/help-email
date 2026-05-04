@@ -87,6 +87,27 @@ prompt_bool() {
 	done
 }
 
+prompt_choice() {
+	local var_name="$1"
+	local label="$2"
+	local default_value="$3"
+	local value
+
+	while true; do
+		read -r -p "${label} [${default_value}]: " value
+		value="${value:-${default_value}}"
+		case "${value,,}" in
+			imap|graph)
+				printf -v "${var_name}" '%s' "${value,,}"
+				return
+				;;
+			*)
+				echo "Enter imap or graph."
+				;;
+		esac
+	done
+}
+
 env_value() {
 	local value="$1"
 	value="${value//\\/\\\\}"
@@ -96,10 +117,15 @@ env_value() {
 
 write_env_file() {
 	cat >"${ENV_FILE}" <<ENVEOF
+MAIL_PROVIDER=$(env_value "${MAIL_PROVIDER_VALUE}")
 IMAP_HOST=$(env_value "${IMAP_HOST_VALUE}")
 IMAP_USERNAME=$(env_value "${IMAP_USERNAME_VALUE}")
 IMAP_PASSWORD=$(env_value "${IMAP_PASSWORD_VALUE}")
 IMAP_MAILBOX=$(env_value "${IMAP_MAILBOX_VALUE}")
+GRAPH_TENANT_ID=$(env_value "${GRAPH_TENANT_ID_VALUE}")
+GRAPH_CLIENT_ID=$(env_value "${GRAPH_CLIENT_ID_VALUE}")
+GRAPH_CLIENT_SECRET=$(env_value "${GRAPH_CLIENT_SECRET_VALUE}")
+GRAPH_MAILBOX=$(env_value "${GRAPH_MAILBOX_VALUE}")
 API_ENDPOINT=$(env_value "${API_ENDPOINT_VALUE}")
 API_HMAC_SECRET=$(env_value "${API_HMAC_SECRET_VALUE}")
 POLL_INTERVAL=$(env_value "${POLL_INTERVAL_VALUE}")
@@ -144,7 +170,7 @@ build_binary() {
 	echo "Building ${BINARY_NAME}..."
 	cd "${REPO_DIR}"
 	go mod tidy
-	CGO_ENABLED=0 GOOS=linux GOARCH="${GOARCH_VALUE}" go build -trimpath -ldflags="-s -w" -o "${REPO_DIR}/${BINARY_NAME}" ./cmd/help-email
+	CGO_ENABLED=0 GOOS=linux GOARCH="${GOARCH_VALUE}" go build -buildvcs=false -trimpath -ldflags="-s -w" -o "${REPO_DIR}/${BINARY_NAME}" ./cmd/help-email
 	install -o root -g root -m 0755 "${REPO_DIR}/${BINARY_NAME}" "${BINARY_PATH}"
 }
 
@@ -167,10 +193,28 @@ create_env_file() {
 	fi
 
 	echo "Enter service configuration values."
-	prompt_value IMAP_HOST_VALUE "Gmail IMAP host" "imap.gmail.com:993"
-	prompt_required IMAP_USERNAME_VALUE "Gmail username"
-	prompt_secret IMAP_PASSWORD_VALUE "Gmail app password"
-	prompt_value IMAP_MAILBOX_VALUE "IMAP mailbox" "INBOX"
+	prompt_choice MAIL_PROVIDER_VALUE "Mail provider (imap for Gmail, graph for Microsoft 365)" "imap"
+	IMAP_HOST_VALUE=""
+	IMAP_USERNAME_VALUE=""
+	IMAP_PASSWORD_VALUE=""
+	IMAP_MAILBOX_VALUE=""
+	GRAPH_TENANT_ID_VALUE=""
+	GRAPH_CLIENT_ID_VALUE=""
+	GRAPH_CLIENT_SECRET_VALUE=""
+	GRAPH_MAILBOX_VALUE=""
+
+	if [[ "${MAIL_PROVIDER_VALUE}" == "imap" ]]; then
+		prompt_value IMAP_HOST_VALUE "Gmail IMAP host" "imap.gmail.com:993"
+		prompt_required IMAP_USERNAME_VALUE "Gmail username"
+		prompt_secret IMAP_PASSWORD_VALUE "Gmail app password"
+		prompt_value IMAP_MAILBOX_VALUE "IMAP mailbox" "INBOX"
+	else
+		prompt_required GRAPH_TENANT_ID_VALUE "Microsoft Entra tenant ID"
+		prompt_required GRAPH_CLIENT_ID_VALUE "Microsoft Graph app client ID"
+		prompt_secret GRAPH_CLIENT_SECRET_VALUE "Microsoft Graph app client secret"
+		prompt_required GRAPH_MAILBOX_VALUE "Microsoft 365 mailbox or shared mailbox email"
+	fi
+
 	prompt_required API_ENDPOINT_VALUE "API endpoint URL"
 	prompt_secret API_HMAC_SECRET_VALUE "API HMAC secret"
 	prompt_value POLL_INTERVAL_VALUE "Poll interval" "30s"
@@ -190,7 +234,7 @@ create_env_file() {
 create_systemd_unit() {
 	cat >"${UNIT_FILE}" <<EOF
 [Unit]
-Description=Gmail IMAP to API email monitor
+Description=Email to API monitor
 After=network-online.target
 Wants=network-online.target
 
@@ -226,7 +270,7 @@ enable_service() {
 
 config_is_ready() {
 	grep -Eq '^API_HMAC_SECRET=.+' "${ENV_FILE}" &&
-		! grep -Eq 'user@example\.com|app-password|https://api\.example\.com/email-webhook|api-hmac-secret' "${ENV_FILE}"
+		! grep -Eq 'user@example\.com|app-password|https://api\.example\.com/email-webhook|api-hmac-secret|replace-with-shared-secret' "${ENV_FILE}"
 }
 
 main() {
@@ -244,7 +288,7 @@ main() {
 Installed ${SERVICE_NAME}.
 
 Next steps:
-  1. Edit ${ENV_FILE} with real Gmail and API credentials.
+  1. Edit ${ENV_FILE} if you need to adjust mail or API credentials.
   2. Start or restart after editing: sudo systemctl restart ${SERVICE_NAME}
   3. Watch logs: sudo journalctl -u ${SERVICE_NAME} -f
   4. Check status: sudo systemctl status ${SERVICE_NAME}
