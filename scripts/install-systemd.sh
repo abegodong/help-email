@@ -212,7 +212,7 @@ create_env_file() {
 		prompt_required GRAPH_TENANT_ID_VALUE "Microsoft Entra tenant ID"
 		prompt_required GRAPH_CLIENT_ID_VALUE "Microsoft Graph app client ID"
 		prompt_secret GRAPH_CLIENT_SECRET_VALUE "Microsoft Graph app client secret"
-		prompt_required GRAPH_MAILBOX_VALUE "Microsoft 365 mailbox or shared mailbox email"
+		prompt_required GRAPH_MAILBOX_VALUE "Microsoft 365 mailbox emails (comma-separated)"
 	fi
 
 	prompt_required API_ENDPOINT_VALUE "API endpoint URL"

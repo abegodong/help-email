@@ -44,6 +44,7 @@ type Config struct {
 	GraphClientID string
 	GraphClientSecret string
 	GraphMailbox string
+	GraphMailboxes []string
 	APIEndpoint  string
 	APIHMACSecret string
 	PollInterval time.Duration
@@ -58,7 +59,13 @@ type State struct {
 	Provider            string `json:"provider,omitempty"`
 	LastUID             uint32 `json:"last_uid"`
 	LastGraphReceivedAt string `json:"last_graph_received_at,omitempty"`
+	GraphMailboxes      map[string]GraphMailboxState `json:"graph_mailboxes,omitempty"`
 	Initialized         bool   `json:"initialized"`
+}
+
+type GraphMailboxState struct {
+	LastReceivedAt string `json:"last_received_at,omitempty"`
+	Initialized    bool   `json:"initialized"`
 }
 
 type EmailPayload struct {
@@ -341,55 +348,97 @@ type graphAttachment struct {
 }
 
 func pollGraphOnce(ctx context.Context, cfg Config, state *State) error {
+	log.Printf("graph poll starting mailboxes=%d process_existing=%t", len(cfg.GraphMailboxes), cfg.ProcessExisting)
+
 	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
 	token, err := graphAccessToken(ctx, httpClient, cfg)
 	if err != nil {
 		return err
 	}
+	log.Printf("graph token acquired mailboxes=%d", len(cfg.GraphMailboxes))
 
-	if !state.Initialized {
-		state.Initialized = true
-		if !cfg.ProcessExisting {
-			state.LastGraphReceivedAt = time.Now().UTC().Format(time.RFC3339)
-		} else {
-			state.LastGraphReceivedAt = "1970-01-01T00:00:00Z"
+	if state.GraphMailboxes == nil {
+		state.GraphMailboxes = map[string]GraphMailboxState{}
+	}
+	if state.LastGraphReceivedAt != "" && len(cfg.GraphMailboxes) == 1 {
+		mailbox := cfg.GraphMailboxes[0]
+		if _, ok := state.GraphMailboxes[mailbox]; !ok {
+			state.GraphMailboxes[mailbox] = GraphMailboxState{
+				LastReceivedAt: state.LastGraphReceivedAt,
+				Initialized:    state.Initialized,
+			}
 		}
+	}
+
+	var mailboxErrors []string
+	for _, mailbox := range cfg.GraphMailboxes {
+		mailboxState := state.GraphMailboxes[mailbox]
+		if err := pollGraphMailbox(ctx, httpClient, cfg, state, &mailboxState, token, mailbox); err != nil {
+			log.Printf("graph mailbox poll failed mailbox=%s error=%v", mailbox, err)
+			mailboxErrors = append(mailboxErrors, fmt.Sprintf("%s: %v", mailbox, err))
+			continue
+		}
+		state.GraphMailboxes[mailbox] = mailboxState
+	}
+	if len(mailboxErrors) > 0 {
+		return fmt.Errorf("graph mailbox errors: %s", strings.Join(mailboxErrors, "; "))
+	}
+
+	return nil
+}
+
+func pollGraphMailbox(ctx context.Context, httpClient *http.Client, cfg Config, state *State, mailboxState *GraphMailboxState, token, mailbox string) error {
+	log.Printf("graph mailbox poll starting mailbox=%s initialized=%t last_received_at=%q", mailbox, mailboxState.Initialized, mailboxState.LastReceivedAt)
+
+	if !mailboxState.Initialized {
+		mailboxState.Initialized = true
+		if !cfg.ProcessExisting {
+			log.Printf("graph first run will skip already-read messages but still process unread inbox messages mailbox=%s", mailbox)
+		} else {
+			mailboxState.LastReceivedAt = "1970-01-01T00:00:00Z"
+		}
+		state.GraphMailboxes[mailbox] = *mailboxState
 		if err := saveState(cfg.StateFile, *state); err != nil {
 			return err
 		}
-		if !cfg.ProcessExisting {
-			return nil
-		}
 	}
 
-	messages, err := graphListMessages(ctx, httpClient, cfg, token, state.LastGraphReceivedAt)
+	messages, err := graphListMessages(ctx, httpClient, cfg, token, mailbox)
 	if err != nil {
 		return err
 	}
+	log.Printf("graph unread message query returned count=%d mailbox=%s", len(messages), mailbox)
 
-	maxReceivedAt := state.LastGraphReceivedAt
+	maxReceivedAt := mailboxState.LastReceivedAt
 	for _, msg := range messages {
-		payload, err := graphPayload(ctx, httpClient, cfg, token, msg)
+		log.Printf("graph processing message id=%s internet_message_id=%q subject=%q received_at=%s from=%s has_attachments=%t", msg.ID, msg.InternetMessageID, msg.Subject, msg.ReceivedDateTime, msg.From.EmailAddress.Address, msg.HasAttachments)
+
+		payload, err := graphPayload(ctx, httpClient, cfg, token, mailbox, msg)
 		if err != nil {
 			return fmt.Errorf("parse graph message %s: %w", msg.ID, err)
 		}
+		log.Printf("graph parsed message id=%s recipients=%d attachments=%d sender=%s source=%s", msg.ID, len(payload.Recipients), len(payload.Attachments), payload.Sender.Email, payload.Sender.Source)
 
 		if err := postPayloadWithRetry(ctx, cfg, payload); err != nil {
 			return fmt.Errorf("post graph message %s: %w", msg.ID, err)
 		}
+		log.Printf("graph submitted message id=%s to API", msg.ID)
 
-		if err := graphMarkRead(ctx, httpClient, cfg, token, msg.ID); err != nil {
+		if err := graphMarkRead(ctx, httpClient, cfg, token, mailbox, msg.ID); err != nil {
 			return fmt.Errorf("mark graph message %s read: %w", msg.ID, err)
 		}
+		log.Printf("graph marked message read id=%s", msg.ID)
 
 		if graphTimeAfter(msg.ReceivedDateTime, maxReceivedAt) {
 			maxReceivedAt = msg.ReceivedDateTime
-			state.LastGraphReceivedAt = maxReceivedAt
+			mailboxState.LastReceivedAt = maxReceivedAt
+			state.GraphMailboxes[mailbox] = *mailboxState
 			if err := saveState(cfg.StateFile, *state); err != nil {
 				return err
 			}
 		}
 	}
+	log.Printf("graph mailbox poll complete mailbox=%s processed=%d last_received_at=%q", mailbox, len(messages), mailboxState.LastReceivedAt)
 
 	return nil
 }
@@ -429,20 +478,15 @@ func graphAccessToken(ctx context.Context, httpClient *http.Client, cfg Config) 
 	return token.AccessToken, nil
 }
 
-func graphListMessages(ctx context.Context, httpClient *http.Client, cfg Config, token, lastReceivedAt string) ([]graphMessage, error) {
+func graphListMessages(ctx context.Context, httpClient *http.Client, cfg Config, token, mailbox string) ([]graphMessage, error) {
 	values := url.Values{}
 	values.Set("$top", "25")
 	values.Set("$orderby", "receivedDateTime asc")
 	values.Set("$select", "id,internetMessageId,conversationId,subject,receivedDateTime,sentDateTime,from,toRecipients,ccRecipients,bccRecipients,body,hasAttachments")
+	values.Set("$filter", "isRead eq false")
 
-	filters := []string{}
-	if lastReceivedAt != "" {
-		filters = append(filters, fmt.Sprintf("receivedDateTime ge %s", lastReceivedAt))
-	}
-	filters = append(filters, "isRead eq false")
-	values.Set("$filter", strings.Join(filters, " and "))
-
-	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/mailFolders/inbox/messages?%s", url.PathEscape(cfg.GraphMailbox), values.Encode())
+	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/mailFolders/inbox/messages?%s", url.PathEscape(mailbox), values.Encode())
+	log.Printf("graph querying unread inbox messages mailbox=%s url=%s", mailbox, endpoint)
 	req, err := graphRequest(ctx, http.MethodGet, endpoint, token, nil)
 	if err != nil {
 		return nil, err
@@ -466,7 +510,7 @@ func graphListMessages(ctx context.Context, httpClient *http.Client, cfg Config,
 	return list.Value, nil
 }
 
-func graphPayload(ctx context.Context, httpClient *http.Client, cfg Config, token string, msg graphMessage) (EmailPayload, error) {
+func graphPayload(ctx context.Context, httpClient *http.Client, cfg Config, token, mailbox string, msg graphMessage) (EmailPayload, error) {
 	body := Body{}
 	switch strings.ToLower(msg.Body.ContentType) {
 	case "html":
@@ -476,7 +520,7 @@ func graphPayload(ctx context.Context, httpClient *http.Client, cfg Config, toke
 		body.Text = msg.Body.Content
 	}
 
-	attachments, err := graphAttachments(ctx, httpClient, cfg, token, msg)
+	attachments, err := graphAttachments(ctx, httpClient, cfg, token, mailbox, msg)
 	if err != nil {
 		return EmailPayload{}, err
 	}
@@ -506,7 +550,7 @@ func graphPayload(ctx context.Context, httpClient *http.Client, cfg Config, toke
 		Body:        body,
 		Attachments: attachments,
 		Graph: &GraphMeta{
-			Mailbox:        cfg.GraphMailbox,
+			Mailbox:        mailbox,
 			MessageID:      msg.ID,
 			ConversationID: msg.ConversationID,
 			ReceivedAt:     msg.ReceivedDateTime,
@@ -514,14 +558,15 @@ func graphPayload(ctx context.Context, httpClient *http.Client, cfg Config, toke
 	}, nil
 }
 
-func graphAttachments(ctx context.Context, httpClient *http.Client, cfg Config, token string, msg graphMessage) ([]Attachment, error) {
+func graphAttachments(ctx context.Context, httpClient *http.Client, cfg Config, token, mailbox string, msg graphMessage) ([]Attachment, error) {
 	if !msg.HasAttachments {
 		return nil, nil
 	}
+	log.Printf("graph fetching attachments message_id=%s mailbox=%s", msg.ID, mailbox)
 
 	values := url.Values{}
 	values.Set("$select", "name,contentType,size,contentBytes")
-	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages/%s/attachments?%s", url.PathEscape(cfg.GraphMailbox), url.PathEscape(msg.ID), values.Encode())
+	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages/%s/attachments?%s", url.PathEscape(mailbox), url.PathEscape(msg.ID), values.Encode())
 	req, err := graphRequest(ctx, http.MethodGet, endpoint, token, nil)
 	if err != nil {
 		return nil, err
@@ -564,9 +609,9 @@ func graphAttachments(ctx context.Context, httpClient *http.Client, cfg Config, 
 	return attachments, nil
 }
 
-func graphMarkRead(ctx context.Context, httpClient *http.Client, cfg Config, token, messageID string) error {
+func graphMarkRead(ctx context.Context, httpClient *http.Client, cfg Config, token, mailbox, messageID string) error {
 	body := strings.NewReader(`{"isRead":true}`)
-	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages/%s", url.PathEscape(cfg.GraphMailbox), url.PathEscape(messageID))
+	endpoint := fmt.Sprintf("https://graph.microsoft.com/v1.0/users/%s/messages/%s", url.PathEscape(mailbox), url.PathEscape(messageID))
 	req, err := graphRequest(ctx, http.MethodPatch, endpoint, token, body)
 	if err != nil {
 		return err
@@ -853,6 +898,7 @@ func postPayloadWithRetry(ctx context.Context, cfg Config, payload EmailPayload)
 			continue
 		}
 
+		log.Printf("api submission succeeded for %s attempt=%d", payloadSourceID(payload), attempt)
 		return nil
 	}
 
@@ -884,6 +930,7 @@ func postPayload(ctx context.Context, cfg Config, payload EmailPayload) error {
 		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("api returned %s: %s", resp.Status, strings.TrimSpace(string(responseBody)))
 	}
+	log.Printf("api returned success status=%s for %s", resp.Status, payloadSourceID(payload))
 
 	return nil
 }
@@ -979,6 +1026,7 @@ func loadConfig() (Config, error) {
 		GraphClientID: os.Getenv("GRAPH_CLIENT_ID"),
 		GraphClientSecret: os.Getenv("GRAPH_CLIENT_SECRET"),
 		GraphMailbox: os.Getenv("GRAPH_MAILBOX"),
+		GraphMailboxes: splitCSV(os.Getenv("GRAPH_MAILBOX")),
 		APIEndpoint:  os.Getenv("API_ENDPOINT"),
 		APIHMACSecret: os.Getenv("API_HMAC_SECRET"),
 		PollInterval: interval,
@@ -1002,7 +1050,7 @@ func loadConfig() (Config, error) {
 		required["GRAPH_TENANT_ID"] = cfg.GraphTenantID
 		required["GRAPH_CLIENT_ID"] = cfg.GraphClientID
 		required["GRAPH_CLIENT_SECRET"] = cfg.GraphClientSecret
-		required["GRAPH_MAILBOX"] = cfg.GraphMailbox
+		required["GRAPH_MAILBOX"] = strings.Join(cfg.GraphMailboxes, ",")
 	default:
 		return Config{}, fmt.Errorf("MAIL_PROVIDER must be imap or graph")
 	}
@@ -1058,6 +1106,17 @@ func envDefaultValue(value, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func splitCSV(raw string) []string {
+	var values []string
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			values = append(values, item)
+		}
+	}
+	return values
 }
 
 func hostOnly(addr string) string {

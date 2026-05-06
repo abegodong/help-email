@@ -109,7 +109,7 @@ MAIL_PROVIDER=graph
 GRAPH_TENANT_ID=00000000-0000-0000-0000-000000000000
 GRAPH_CLIENT_ID=00000000-0000-0000-0000-000000000000
 GRAPH_CLIENT_SECRET=client-secret
-GRAPH_MAILBOX=shared-mailbox@example.com
+GRAPH_MAILBOX=shared-mailbox@example.com,second-mailbox@example.com
 API_ENDPOINT=https://api.example.com/email-webhook
 API_HMAC_SECRET=replace-with-shared-secret
 POLL_INTERVAL=30s
@@ -120,9 +120,9 @@ HTTP_TIMEOUT=30s
 PROCESS_EXISTING=false
 ```
 
-For unattended system service use, create a Microsoft Entra app registration and grant Microsoft Graph application permission `Mail.ReadWrite`, then admin-consent it. In production, restrict the app to the intended mailbox with an Exchange Online application access policy. `GRAPH_MAILBOX` can be a user mailbox or a shared mailbox email address.
+For unattended system service use, create a Microsoft Entra app registration and grant Microsoft Graph application permission `Mail.ReadWrite`, then admin-consent it. In production, restrict the app to the intended mailboxes with an Exchange Online application access policy. `GRAPH_MAILBOX` is a comma-separated list of user mailbox or shared mailbox email addresses.
 
-With `PROCESS_EXISTING=false`, the first Graph run records the current time and only sends unread messages received after that point. With `PROCESS_EXISTING=true`, it sends existing unread inbox messages too. After successful API submission, Graph messages are marked read by setting `isRead` to `true`.
+For Graph, the service queries unread Inbox messages in each configured mailbox and marks each message read only after successful API submission. `PROCESS_EXISTING=false` skips messages that are already read, but unread messages in the mailbox are still eligible on the first run. After successful API submission, Graph messages are marked read by setting `isRead` to `true`. State is tracked separately per Graph mailbox.
 
 ## Get Microsoft 365 Graph config from Entra
 
@@ -170,10 +170,10 @@ Grant Microsoft Graph mail permissions:
 Set the mailbox:
 
 ```sh
-GRAPH_MAILBOX=shared-mailbox@example.com
+GRAPH_MAILBOX=shared-mailbox@example.com,second-mailbox@example.com
 ```
 
-`GRAPH_MAILBOX` should be the primary SMTP address or user principal name of the Microsoft 365 mailbox to monitor. It can be a normal user mailbox or a shared mailbox.
+`GRAPH_MAILBOX` should contain one or more comma-separated primary SMTP addresses or user principal names of the Microsoft 365 mailboxes to monitor. Each entry can be a normal user mailbox or a shared mailbox, and all entries use the same Entra app credentials.
 
 Recommended production scoping:
 
