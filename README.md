@@ -124,6 +124,49 @@ For unattended system service use, create a Microsoft Entra app registration and
 
 For Graph, the service queries unread Inbox messages in each configured mailbox and marks each message read only after successful API submission. `PROCESS_EXISTING=false` skips messages that are already read, but unread messages in the mailbox are still eligible on the first run. After successful API submission, Graph messages are marked read by setting `isRead` to `true`. State is tracked separately per Graph mailbox.
 
+## Body content behavior
+
+For IMAP, the service reads MIME parts directly:
+
+- `text/plain` parts go to `body.text`.
+- `text/html` parts go to `body.html`.
+
+For Microsoft Graph, the service reads the Graph message `body` field:
+
+- If Graph returns HTML, the original Graph HTML string is sent as `body.html`.
+- The service also derives `body.text` from that HTML by stripping tags and unescaping HTML entities.
+- The HTML-to-text conversion does not replace or compress `body.html`.
+
+Graph `body.content` is not the same as raw MIME. Microsoft Graph can return safe/sanitized HTML for message bodies. If you need the exact original MIME that Microsoft received, fetch the message `/$value` MIME endpoint and parse or forward that raw MIME separately; this service currently sends the Graph JSON body, not raw MIME.
+
+## Troubleshooting Graph delivery
+
+Check service logs:
+
+```sh
+sudo journalctl -u help-email -f
+```
+
+The Graph path logs:
+
+- Poll start and mailbox count.
+- Token acquisition.
+- Each mailbox being queried.
+- The Graph unread-message query URL.
+- Count of unread messages returned.
+- Message ID, subject, sender, received time, and attachment flag.
+- Parsed recipient and attachment counts.
+- API submission success or retry.
+- Graph mark-read success.
+
+If a message is not sent, check these first:
+
+- The message is in the mailbox Inbox and is unread.
+- `GRAPH_MAILBOX` contains the mailbox address exactly, separated by commas if multiple.
+- The Entra app has `Mail.ReadWrite` application permission with admin consent.
+- Exchange mailbox scoping allows this app to access the mailbox.
+- The API returns a `2xx` response. Messages are marked read only after successful API submission.
+
 ## Get Microsoft 365 Graph config from Entra
 
 You need these values for `MAIL_PROVIDER=graph`:
